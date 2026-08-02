@@ -14,6 +14,10 @@ HUB8735 Ultra 的 Arduino SDK 沒有提供 I2S 播放的 library。本專案直�
 
 ## 接線
 
+![接線圖:MAX98357A + 3W 喇叭接上 HUB8735 Ultra](docs/wiring.png)
+
+*完整語音專案的參考接線:I2S 功放、板載 PDM 麥克風、SD 卡、外接觸發按鈕。本 library 只需要 I2S 功放的部分。*
+
 RTL8735B 的 I2S 腳位是**固定 pin group,不可重新映射**:
 
 | MAX98357 | HUB8735 Ultra | SoC 腳位 | 說明 |

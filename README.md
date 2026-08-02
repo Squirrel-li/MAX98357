@@ -14,6 +14,10 @@ The Arduino SDK for HUB8735 Ultra ships **no I2S playback library**. This librar
 
 ## Wiring
 
+![Wiring diagram: MAX98357A and a 3W speaker on HUB8735 Ultra](docs/wiring.png)
+
+*Reference wiring for a full voice project (annotated in Chinese): I2S amplifier, the on-board PDM mic, SD card, and an external trigger button. Only the I2S amplifier part is required by this library.*
+
 The RTL8735B I2S pins are a **fixed pin group and cannot be remapped**:
 
 | MAX98357 | HUB8735 Ultra | SoC pin | Notes |
