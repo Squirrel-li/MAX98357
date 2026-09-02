@@ -26,7 +26,10 @@
 #define I2S_DMA_PAGE_NUM  4
 #define I2S_DMA_PAGE_SIZE 1024  // bytes per page, multiple of 64, max 4095
 
-#define RING_SLOTS 8             // page-sized slots between producer and ISR
+// 32 KiB gives about 186 ms of headroom at 44.1 kHz stereo. This absorbs
+// normal WiFi scheduling gaps and occasional SD/FatFS read latency.
+#define RING_SLOTS 32            // page-sized slots between producer and ISR
+#define PREBUFFER_SLOTS 16       // fill half the ring before starting I2S
 
 #define MP3_INBUF_SIZE  4096                 // >= MAINBUF_SIZE (1940)
 #define MP3_OUTBUF_SAMP (1152 * 2)           // max samples per MP3 frame
@@ -45,6 +48,13 @@ static uint8_t s_ring[RING_SLOTS][I2S_DMA_PAGE_SIZE];
 static volatile uint32_t s_ring_head = 0;    // total slots produced
 static volatile uint32_t s_ring_tail = 0;    // total slots consumed
 static uint32_t s_slot_fill = 0;             // bytes written into current head slot
+
+static void reset_ring(void)
+{
+    s_ring_head = 0;
+    s_ring_tail = 0;
+    s_slot_fill = 0;
+}
 
 // Copy the next ring slot (or silence) into a DMA page and hand it back
 // to the hardware. Shared by the pre-fill loop and the TX-done ISR.
@@ -109,6 +119,38 @@ static size_t readFromStream(void *ctx, uint8_t *buf, size_t len)
             }
             delay(1);
         }
+    }
+    return got;
+}
+
+// Client (WiFiClient/WiFiSSLClient) supports buffer reads. Use that API
+// instead of Stream::read() one byte at a time so network audio can keep
+// the I2S ring filled.
+static size_t readFromClient(void *ctx, uint8_t *buf, size_t len)
+{
+    Client *client = (Client *)ctx;
+    size_t got = 0;
+    uint32_t lastData = millis();
+
+    while (got < len) {
+        int avail = client->available();
+        if (avail > 0) {
+            // Ameba WiFiClient::available() is boolean-like: it returns 1
+            // when any data exists, not the number of buffered bytes.
+            size_t want = len - got;
+            int n = client->read(buf + got, want);
+            if (n > 0) {
+                got += (size_t)n;
+                lastData = millis();
+                continue;
+            }
+        }
+
+        if ((!client->connected() && client->available() == 0) ||
+            (millis() - lastData) > 1500) {
+            break;
+        }
+        delay(1);
     }
     return got;
 }
@@ -206,10 +248,6 @@ bool MAX98357::startOutput(int srEnum)
     i2s_set_param(&s_i2s, CH_STEREO, srEnum, WL_16b);
     // No TX-only mode in the low layer - run TXRX and discard RX.
     i2s_set_direction(&s_i2s, I2S_DIR_TXRX);
-
-    s_ring_head = 0;
-    s_ring_tail = 0;
-    s_slot_fill = 0;
 
     // Arm ALL RX pages and pre-send ALL TX pages, then enable - this
     // exact order comes from module_i2s.c / the official i2s example.
@@ -326,6 +364,7 @@ bool MAX98357::beginPCM(uint32_t sampleRate, uint16_t channels)
     }
     _streamChans = channels;
     _streamRate = sampleRate;
+    reset_ring();
     return startOutput(sr);
 }
 
@@ -367,6 +406,11 @@ bool MAX98357::playWav(File &f)
 bool MAX98357::playWavStream(Stream &s)
 {
     return playWavCommon(readFromStream, &s, false, NULL);
+}
+
+bool MAX98357::playWavStream(Client &s)
+{
+    return playWavCommon(readFromClient, &s, false, NULL);
 }
 
 static uint32_t le32(const uint8_t *p)
@@ -487,11 +531,9 @@ bool MAX98357::playWavCommon(ReadFn rd, void *ctx, bool canSeek, File *f)
     // size - in that case play until the source ends.
     bool untilEof = (dataSize == 0 || dataSize == 0xFFFFFFFF);
 
-    if (!startOutput(sr)) {
-        return false;
-    }
-
+    reset_ring();
     bool ok = true;
+    bool outputStarted = false;
     uint32_t remaining = dataSize;
     while (untilEof || remaining > 0) {
         uint32_t want = sizeof(s_readbuf);
@@ -513,12 +555,31 @@ bool MAX98357::playWavCommon(ReadFn rd, void *ctx, bool canSeek, File *f)
             ok = false;
             break;
         }
+        if (!outputStarted &&
+            (s_ring_head - s_ring_tail) >= PREBUFFER_SLOTS) {
+            if (!startOutput(sr)) {
+                return false;
+            }
+            outputStarted = true;
+        }
         if (got < want && untilEof) {
             break;
         }
     }
 
-    stopOutput(sampleRate);
+    // Short clips may end before reaching the normal prebuffer target.
+    if (ok && !outputStarted) {
+        flushSlot();
+        if ((s_ring_head - s_ring_tail) > 0) {
+            if (!startOutput(sr)) {
+                return false;
+            }
+            outputStarted = true;
+        }
+    }
+    if (outputStarted) {
+        stopOutput(sampleRate);
+    }
     return ok;
 }
 
@@ -548,6 +609,11 @@ bool MAX98357::playMp3Stream(Stream &s)
     return playMp3Common(readFromStream, &s);
 }
 
+bool MAX98357::playMp3Stream(Client &s)
+{
+    return playMp3Common(readFromClient, &s);
+}
+
 bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
 {
     if (!_inited) {
@@ -566,9 +632,13 @@ bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
     int bytesLeft = 0;
     bool eof = false;
     bool started = false;
+    bool outputStarted = false;
     bool ok = true;
     uint32_t sampleRate = 0;
+    int sampleRateEnum = -1;
     int chans = 2;
+
+    reset_ring();
 
     while (true) {
         // Refill: move the leftover to the front, top up from source.
@@ -615,22 +685,26 @@ bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
             MP3FrameInfo fi;
             MP3GetLastFrameInfo(s_mp3dec, &fi);
             if (!started) {
-                int sr = mapSampleRate((uint32_t)fi.samprate);
-                if (sr < 0) {
+                sampleRateEnum = mapSampleRate((uint32_t)fi.samprate);
+                if (sampleRateEnum < 0) {
                     _err = "unsupported sample rate";
                     return false;
                 }
                 sampleRate = (uint32_t)fi.samprate;
                 chans = fi.nChans;
-                if (!startOutput(sr)) {
-                    return false;
-                }
                 started = true;
             }
             if (fi.outputSamps > 0) {
                 if (!pushBlock(s_mp3out, (size_t)fi.outputSamps, chans == 2)) {
                     ok = false;
                     break;
+                }
+                if (!outputStarted &&
+                    (s_ring_head - s_ring_tail) >= PREBUFFER_SLOTS) {
+                    if (!startOutput(sampleRateEnum)) {
+                        return false;
+                    }
+                    outputStarted = true;
                 }
             }
             // Keep a safety margin so MP3Decode never reads past the
@@ -651,6 +725,17 @@ bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
         _err = "no decodable MP3 frames found";
         return false;
     }
-    stopOutput(sampleRate);
+    if (ok && !outputStarted) {
+        flushSlot();
+        if ((s_ring_head - s_ring_tail) > 0) {
+            if (!startOutput(sampleRateEnum)) {
+                return false;
+            }
+            outputStarted = true;
+        }
+    }
+    if (outputStarted) {
+        stopOutput(sampleRate);
+    }
     return ok;
 }

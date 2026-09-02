@@ -32,6 +32,7 @@
 #define MAX98357_H
 
 #include <Arduino.h>
+#include <Client.h>
 #include "AmebaFatFS.h"
 
 class MAX98357 {
@@ -62,11 +63,13 @@ public:
     // Play WAV from a forward-only stream, e.g. a WiFiClient already
     // positioned at the start of an HTTP response body (after headers).
     // Handles unknown data size (streams until the connection ends).
+    bool playWavStream(Client &s);
     bool playWavStream(Stream &s);
 
     // ---- MP3 (Helix decoder) ----
     bool playMp3(AmebaFatFS &fs, const char *filename);
     bool playMp3(File &f);
+    bool playMp3Stream(Client &s);
     bool playMp3Stream(Stream &s);
 
     // ---- Raw PCM push API (for TTS responses, synthesis, etc.) ----
