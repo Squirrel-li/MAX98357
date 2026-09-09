@@ -72,6 +72,12 @@ public:
     bool playMp3Stream(Client &s);
     bool playMp3Stream(Stream &s);
 
+    // Ask the active playback call to stop as soon as possible. This only
+    // sets a flag; the task running playMp3()/playWav() performs the actual
+    // I2S shutdown before returning. Do not call another play function until
+    // the current one has returned.
+    void requestStop(void);
+
     // ---- Raw PCM push API (for TTS responses, synthesis, etc.) ----
     // Start the I2S output at the given rate/channels, then push
     // interleaved 16-bit samples with writePCM (blocks while the
@@ -93,6 +99,7 @@ private:
     void stopOutput(uint32_t sampleRate);
     bool pushBlock(const int16_t *samples, size_t count, bool stereo);
     bool flushSlot(void);
+    void abortOutput(void);
     bool waitSlotFree(void);
     bool playWavCommon(ReadFn rd, void *ctx, bool canSeek, File *f);
     bool playMp3Common(ReadFn rd, void *ctx);

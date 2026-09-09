@@ -114,10 +114,16 @@ amp.endPCM();
 | `bool playMp3(AmebaFatFS &fs, const char *filename)` | 播放 SD 卡根目錄的 MP3 |
 | `bool playMp3(File &f)` | 播放已開啟的 MP3 檔案 |
 | `bool playMp3Stream(Stream &s)` | 從串流播放 MP3 |
+| `void requestStop()` | 要求目前播放盡快停止；由執行 `playMp3()` 的 task 完成 I2S 關閉後返回 |
 | `bool beginPCM(uint32_t rate, uint16_t ch)` | 開始原始 PCM 輸出(16-bit 交錯) |
 | `bool writePCM(const int16_t *data, size_t n)` | 推送 n 個 int16 樣本;緩衝滿時阻塞等待 |
 | `void endPCM()` | 沖空緩衝並停止 PCM 輸出 |
 | `const char *lastError()` | 最近一次失敗的原因 |
+
+playMp3() 本身仍然是阻塞函式。若要在 FreeRTOS 中切歌，請讓專用
+audioTask 呼叫 playMp3()，其他 task 呼叫 requestStop()，並等待目前的
+playMp3() 返回後，再由 audioTask 播放下一首。不要用 vTaskDelete() 強制
+刪除正在播放的 task，也不要讓兩個 task 同時呼叫播放函式。
 
 ### 支援的音檔格式
 

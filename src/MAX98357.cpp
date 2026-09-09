@@ -48,6 +48,9 @@ static uint8_t s_ring[RING_SLOTS][I2S_DMA_PAGE_SIZE];
 static volatile uint32_t s_ring_head = 0;    // total slots produced
 static volatile uint32_t s_ring_tail = 0;    // total slots consumed
 static uint32_t s_slot_fill = 0;             // bytes written into current head slot
+// Set by another task to request cooperative cancellation. The task that is
+// decoding audio owns the I2S shutdown and performs it before returning.
+static volatile bool s_stop_requested = false;
 
 static void reset_ring(void)
 {
@@ -92,6 +95,9 @@ static void rx_done_cb(uint32_t id, char *pbuf)
 
 static size_t readFromFile(void *ctx, uint8_t *buf, size_t len)
 {
+    if (s_stop_requested) {
+        return 0;
+    }
     File *f = (File *)ctx;
     int got = f->read(buf, len);
     return (got > 0) ? (size_t)got : 0;
@@ -105,6 +111,9 @@ static size_t readFromStream(void *ctx, uint8_t *buf, size_t len)
     size_t got = 0;
     uint32_t lastData = millis();
     while (got < len) {
+        if (s_stop_requested) {
+            break;
+        }
         int avail = s->available();
         if (avail > 0) {
             int c = s->read();
@@ -133,6 +142,9 @@ static size_t readFromClient(void *ctx, uint8_t *buf, size_t len)
     uint32_t lastData = millis();
 
     while (got < len) {
+        if (s_stop_requested) {
+            break;
+        }
         int avail = client->available();
         if (avail > 0) {
             // Ameba WiFiClient::available() is boolean-like: it returns 1
@@ -200,6 +212,13 @@ void MAX98357::end(void)
     i2s_disable(&s_i2s);
     i2s_deinit(&s_i2s);
     _inited = false;
+}
+
+void MAX98357::requestStop(void)
+{
+    // Do not disable I2S here: this method may be called by a control task
+    // while the audio task is still producing ring-buffer data.
+    s_stop_requested = true;
 }
 
 void MAX98357::setVolume(float vol)
@@ -294,10 +313,27 @@ void MAX98357::stopOutput(uint32_t sampleRate)
     _outputActive = false;
 }
 
+void MAX98357::abortOutput(void)
+{
+    // Unlike stopOutput(), do not drain the ring. This is the path used for
+    // a song switch, so already queued samples belong to the old song.
+    if (_outputActive) {
+        i2s_disable(&s_i2s);
+        if (_sdPin >= 0) {
+            digitalWrite(_sdPin, LOW);
+        }
+        _outputActive = false;
+    }
+    reset_ring();
+}
+
 bool MAX98357::waitSlotFree(void)
 {
     uint32_t t0 = millis();
     while ((s_ring_head - s_ring_tail) >= RING_SLOTS) {
+        if (s_stop_requested) {
+            return false;
+        }
         if ((millis() - t0) > 2000) {
             _err = "I2S TX stalled (no page consumed in 2s)";
             return false;
@@ -312,6 +348,9 @@ bool MAX98357::waitSlotFree(void)
 bool MAX98357::pushBlock(const int16_t *samples, size_t count, bool stereo)
 {
     for (size_t i = 0; i < count; i++) {
+        if (s_stop_requested) {
+            return false;
+        }
         int16_t v = (int16_t)(((int32_t)samples[i] * _vol_q8) >> 8);
 
         if (s_slot_fill == 0 && !waitSlotFree()) {
@@ -428,6 +467,9 @@ static size_t rdFully(MAX98357::ReadFn rd, void *ctx, uint8_t *buf, size_t want)
 {
     size_t got = 0;
     while (got < want) {
+        if (s_stop_requested) {
+            break;
+        }
         size_t n = rd(ctx, buf + got, want - got);
         if (n == 0) {
             break;
@@ -458,6 +500,7 @@ bool MAX98357::playWavCommon(ReadFn rd, void *ctx, bool canSeek, File *f)
     }
     (void)canSeek;
     (void)f;
+    s_stop_requested = false;
 
     uint8_t hdr[12];
     if (rdFully(rd, ctx, hdr, 12) != 12 ||
@@ -536,6 +579,9 @@ bool MAX98357::playWavCommon(ReadFn rd, void *ctx, bool canSeek, File *f)
     bool outputStarted = false;
     uint32_t remaining = dataSize;
     while (untilEof || remaining > 0) {
+        if (s_stop_requested) {
+            break;
+        }
         uint32_t want = sizeof(s_readbuf);
         if (!untilEof && remaining < want) {
             want = remaining;
@@ -565,6 +611,15 @@ bool MAX98357::playWavCommon(ReadFn rd, void *ctx, bool canSeek, File *f)
         if (got < want && untilEof) {
             break;
         }
+    }
+
+    if (s_stop_requested) {
+        if (outputStarted) {
+            abortOutput();
+        } else {
+            reset_ring();
+        }
+        return true;
     }
 
     // Short clips may end before reaching the normal prebuffer target.
@@ -628,6 +683,10 @@ bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
         }
     }
 
+    // A previous request belongs to the previous playback. The next call is
+    // owned by the audio task, so it starts with a fresh cancellation state.
+    s_stop_requested = false;
+
     uint8_t *rp = s_mp3in;
     int bytesLeft = 0;
     bool eof = false;
@@ -641,6 +700,9 @@ bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
     reset_ring();
 
     while (true) {
+        if (s_stop_requested) {
+            break;
+        }
         // Refill: move the leftover to the front, top up from source.
         if (bytesLeft > 0 && rp != s_mp3in) {
             memmove(s_mp3in, rp, bytesLeft);
@@ -660,6 +722,9 @@ bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
         // Decode as many frames as the buffer allows.
         bool progressed = false;
         while (bytesLeft > 4) {
+            if (s_stop_requested) {
+                break;
+            }
             int off = MP3FindSyncWord(rp, bytesLeft);
             if (off < 0) {
                 bytesLeft = 0;  // no sync in the whole buffer - discard
@@ -716,9 +781,21 @@ bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
         if (!ok) {
             break;
         }
+        if (s_stop_requested) {
+            break;
+        }
         if (eof && (!progressed || bytesLeft <= 4)) {
             break;
         }
+    }
+
+    if (s_stop_requested) {
+        if (outputStarted) {
+            abortOutput();
+        } else {
+            reset_ring();
+        }
+        return true;
     }
 
     if (!started) {
