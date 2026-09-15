@@ -24,7 +24,7 @@
 #include "mp3dec.h"      // Helix MP3 decoder, implemented in libhmp3.a
 
 #define I2S_DMA_PAGE_NUM  4
-#define I2S_DMA_PAGE_SIZE 1024  // bytes per page, multiple of 64, max 4095
+#define I2S_DMA_PAGE_SIZE 2048  // bytes per page, multiple of 64, max 4095
 
 // 32 KiB gives about 186 ms of headroom at 44.1 kHz stereo. This absorbs
 // normal WiFi scheduling gaps and occasional SD/FatFS read latency.
@@ -169,7 +169,16 @@ static size_t readFromClient(void *ctx, uint8_t *buf, size_t len)
 
 MAX98357::MAX98357()
     : _vol_q8(256), _inited(false), _outputActive(false),
-      _streamChans(2), _streamRate(16000), _sdPin(-1), _err("")
+      _streamChans(2), _streamRate(16000), _sdPin(-1), _err(""),
+      _mp3File(NULL), _mp3ReadPtr(s_mp3in), _mp3BytesLeft(0),
+      _mp3Active(false), _mp3Eof(false), _mp3Started(false),
+      _mp3OutputStarted(false), _mp3Paused(false),
+      _mp3PauseRequested(false), _mp3PauseDrainStarted(false),
+      _mp3Finishing(false), _mp3DrainStarted(false),
+      _mp3SampleRate(0),
+      _mp3DrainStartedMs(0), _mp3DrainDelayMs(0),
+      _mp3PauseDrainStartedMs(0), _mp3PauseDrainDelayMs(0),
+      _mp3SampleRateEnum(-1), _mp3Channels(2)
 {
 }
 
@@ -206,6 +215,9 @@ bool MAX98357::begin(void)
 
 void MAX98357::end(void)
 {
+    if (_mp3Active) {
+        stopMp3();
+    }
     if (!_inited) {
         return;
     }
@@ -366,6 +378,40 @@ bool MAX98357::pushBlock(const int16_t *samples, size_t count, bool stereo)
         if (s_slot_fill >= I2S_DMA_PAGE_SIZE) {
             s_ring_head = s_ring_head + 1;  // publish full slot
             s_slot_fill = 0;
+        }
+    }
+    return true;
+}
+
+// Write samples without waiting for a free ring slot.
+bool MAX98357::pushBlockNonBlocking(const int16_t *samples, size_t count, bool stereo)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (s_stop_requested) {
+            return false;
+        }
+
+        const int16_t v = (int16_t)(((int32_t)samples[i] * _vol_q8) >> 8);
+        const uint32_t bytesPerSample = stereo ? 2U : 4U;
+        if (s_slot_fill > 0 &&
+            s_slot_fill + bytesPerSample > I2S_DMA_PAGE_SIZE) {
+            uint8_t *partialSlot = s_ring[s_ring_head % RING_SLOTS];
+            memset(partialSlot + s_slot_fill, 0,
+                   I2S_DMA_PAGE_SIZE - s_slot_fill);
+            s_ring_head = s_ring_head + 1;
+            s_slot_fill = 0;
+        }
+        if (s_slot_fill == 0 &&
+            (s_ring_head - s_ring_tail) >= RING_SLOTS) {
+            return false;
+        }
+
+        int16_t *slot = (int16_t *)s_ring[s_ring_head % RING_SLOTS];
+        slot[s_slot_fill >> 1] = v;
+        s_slot_fill += 2;
+        if (!stereo) {
+            slot[s_slot_fill >> 1] = v;
+            s_slot_fill += 2;
         }
     }
     return true;
@@ -653,6 +699,398 @@ bool MAX98357::playMp3(AmebaFatFS &fs, const char *filename)
     return ok;
 }
 
+void MAX98357::closeMp3File(void)
+{
+    if (_mp3File != NULL) {
+        _mp3File->close();
+        delete _mp3File;
+        _mp3File = NULL;
+    }
+}
+
+void MAX98357::clearMp3State(void)
+{
+    closeMp3File();
+    _mp3ReadPtr = s_mp3in;
+    _mp3BytesLeft = 0;
+    _mp3Active = false;
+    _mp3Eof = false;
+    _mp3Started = false;
+    _mp3OutputStarted = false;
+    _mp3Paused = false;
+    _mp3PauseRequested = false;
+    _mp3PauseDrainStarted = false;
+    _mp3Finishing = false;
+    _mp3DrainStarted = false;
+    _mp3SampleRate = 0;
+    _mp3DrainStartedMs = 0;
+    _mp3DrainDelayMs = 0;
+    _mp3PauseDrainStartedMs = 0;
+    _mp3PauseDrainDelayMs = 0;
+    _mp3SampleRateEnum = -1;
+    _mp3Channels = 2;
+    s_stop_requested = false;
+}
+
+bool MAX98357::beginMp3(AmebaFatFS &fs, const char *filename)
+{
+    if (!_inited) {
+        _err = "begin() not called";
+        return false;
+    }
+    if (filename == NULL || filename[0] == '\0') {
+        _err = "empty MP3 filename";
+        return false;
+    }
+    if (_mp3Active) {
+        _err = "non-blocking MP3 playback is already active";
+        return false;
+    }
+    if (_outputActive) {
+        _err = "audio output is already active";
+        return false;
+    }
+    if (s_mp3dec == NULL) {
+        s_mp3dec = MP3InitDecoder();
+        if (s_mp3dec == NULL) {
+            _err = "MP3 decoder alloc failed";
+            return false;
+        }
+    }
+
+    String path = String(fs.getRootPath()) + filename;
+    File *file = new File();
+    if (file == NULL || !file->open(path.c_str())) {
+        if (file != NULL) {
+            delete file;
+        }
+        _err = "cannot open file";
+        return false;
+    }
+
+    reset_ring();
+    s_stop_requested = false;
+    _mp3File = file;
+    _mp3File->seek(0);
+    _mp3ReadPtr = s_mp3in;
+    _mp3BytesLeft = 0;
+    _mp3Active = true;
+    _mp3Eof = false;
+    _mp3Started = false;
+    _mp3OutputStarted = false;
+    _mp3Paused = false;
+    _mp3PauseRequested = false;
+    _mp3PauseDrainStarted = false;
+    _mp3Finishing = false;
+    _mp3DrainStarted = false;
+    _mp3SampleRate = 0;
+    _mp3DrainStartedMs = 0;
+    _mp3DrainDelayMs = 0;
+    _mp3PauseDrainStartedMs = 0;
+    _mp3PauseDrainDelayMs = 0;
+    _mp3SampleRateEnum = -1;
+    _mp3Channels = 2;
+    return true;
+}
+
+bool MAX98357::refillMp3Input(void)
+{
+    if (_mp3File == NULL || _mp3Eof) {
+        return false;
+    }
+
+    if (_mp3BytesLeft > 0 && _mp3ReadPtr != s_mp3in) {
+        memmove(s_mp3in, _mp3ReadPtr, (size_t)_mp3BytesLeft);
+    }
+    _mp3ReadPtr = s_mp3in;
+
+    const size_t freeBytes = sizeof(s_mp3in) - (size_t)_mp3BytesLeft;
+    if (freeBytes == 0) {
+        return true;
+    }
+
+    const int got = _mp3File->read(s_mp3in + _mp3BytesLeft, freeBytes);
+    if (got <= 0) {
+        _mp3Eof = true;
+        return false;
+    }
+    _mp3BytesLeft += got;
+    return true;
+}
+
+bool MAX98357::hasMp3OutputSpace(void) const
+{
+    const uint32_t used = s_ring_head - s_ring_tail;
+    if (used >= RING_SLOTS) {
+        return false;
+    }
+
+    uint32_t capacity = (RING_SLOTS - used) * I2S_DMA_PAGE_SIZE;
+    if (s_slot_fill > 0) {
+        capacity += I2S_DMA_PAGE_SIZE - s_slot_fill;
+    }
+    // Reserve enough room for one maximum decoder frame, including mono-to-stereo duplication.
+    return capacity >= (sizeof(s_mp3out) * 2UL);
+}
+
+bool MAX98357::pauseMp3(void)
+{
+    if (!_mp3Active || _mp3Finishing) {
+        return false;
+    }
+    if (_mp3Paused || _mp3PauseRequested) {
+        return true;
+    }
+    _mp3PauseRequested = true;
+    _mp3PauseDrainStarted = false;
+    return true;
+}
+
+bool MAX98357::resumeMp3(void)
+{
+    if (!_mp3Active) {
+        return false;
+    }
+    if (_mp3PauseRequested) {
+        _mp3PauseRequested = false;
+        _mp3PauseDrainStarted = false;
+        return true;
+    }
+    if (!_mp3Paused) {
+        return false;
+    }
+    _mp3Paused = false;
+    return true;
+}
+
+Mp3ProcessResult MAX98357::pauseMp3Step(void)
+{
+    if (!_mp3PauseRequested) {
+        return _mp3Paused ? Mp3ProcessResult::Paused : Mp3ProcessResult::Playing;
+    }
+
+    // Finish samples already decoded into the ring before pausing. This
+    // preserves the audible position instead of discarding buffered audio.
+    if (!_mp3OutputStarted) {
+        _mp3Paused = true;
+        _mp3PauseRequested = false;
+        return Mp3ProcessResult::Paused;
+    }
+
+    if (s_slot_fill > 0) {
+        if ((s_ring_head - s_ring_tail) >= RING_SLOTS) {
+            return Mp3ProcessResult::Playing;
+        }
+        flushSlot();
+    }
+    if ((s_ring_head - s_ring_tail) > 0) {
+        return Mp3ProcessResult::Playing;
+    }
+
+    if (!_mp3PauseDrainStarted) {
+        const uint32_t pageMs =
+            (I2S_DMA_PAGE_SIZE * 1000UL) / (_mp3SampleRate * 4UL);
+        _mp3PauseDrainDelayMs = pageMs * (I2S_DMA_PAGE_NUM + 1) + 5;
+        _mp3PauseDrainStartedMs = millis();
+        _mp3PauseDrainStarted = true;
+    }
+    if ((uint32_t)(millis() - _mp3PauseDrainStartedMs) <
+        _mp3PauseDrainDelayMs) {
+        return Mp3ProcessResult::Playing;
+    }
+
+    if (_sdPin >= 0) {
+        digitalWrite(_sdPin, LOW);
+    }
+    i2s_disable(&s_i2s);
+    _outputActive = false;
+    reset_ring();
+    _mp3OutputStarted = false;
+    _mp3PauseRequested = false;
+    _mp3PauseDrainStarted = false;
+    _mp3Paused = true;
+    return Mp3ProcessResult::Paused;
+}
+
+void MAX98357::stopMp3(void)
+{
+    if (!_mp3Active) {
+        return;
+    }
+
+    s_stop_requested = true;
+    if (_outputActive) {
+        abortOutput();
+    } else {
+        reset_ring();
+    }
+    clearMp3State();
+}
+
+Mp3ProcessResult MAX98357::finishMp3(void)
+{
+    if (!_mp3Started) {
+        _err = "no decodable MP3 frames found";
+        stopMp3();
+        return Mp3ProcessResult::Error;
+    }
+
+    if (s_slot_fill > 0) {
+        if ((s_ring_head - s_ring_tail) >= RING_SLOTS) {
+            return Mp3ProcessResult::Playing;
+        }
+        flushSlot();
+    }
+
+    if (!_mp3OutputStarted) {
+        if ((s_ring_head - s_ring_tail) == 0) {
+            clearMp3State();
+            return Mp3ProcessResult::Finished;
+        }
+        if (!startOutput(_mp3SampleRateEnum)) {
+            _err = "I2S output start failed";
+            stopMp3();
+            return Mp3ProcessResult::Error;
+        }
+        _mp3OutputStarted = true;
+    }
+
+    if ((s_ring_head - s_ring_tail) > 0) {
+        return Mp3ProcessResult::Playing;
+    }
+
+    if (!_mp3DrainStarted) {
+        const uint32_t pageMs =
+            (I2S_DMA_PAGE_SIZE * 1000UL) / (_mp3SampleRate * 4UL);
+        _mp3DrainDelayMs = pageMs * (I2S_DMA_PAGE_NUM + 1) + 5;
+        _mp3DrainStartedMs = millis();
+        _mp3DrainStarted = true;
+    }
+
+    if ((uint32_t)(millis() - _mp3DrainStartedMs) < _mp3DrainDelayMs) {
+        return Mp3ProcessResult::Playing;
+    }
+
+    if (_sdPin >= 0) {
+        digitalWrite(_sdPin, LOW);
+    }
+    i2s_disable(&s_i2s);
+    _outputActive = false;
+    clearMp3State();
+    return Mp3ProcessResult::Finished;
+}
+
+Mp3ProcessResult MAX98357::processMp3(void)
+{
+    if (!_mp3Active) {
+        return Mp3ProcessResult::Idle;
+    }
+    if (s_stop_requested) {
+        stopMp3();
+        return Mp3ProcessResult::Stopped;
+    }
+    if (_mp3PauseRequested) {
+        return pauseMp3Step();
+    }
+    if (_mp3Paused) {
+        return Mp3ProcessResult::Paused;
+    }
+    if (_mp3Finishing) {
+        return finishMp3();
+    }
+
+    if (!_mp3Eof && _mp3BytesLeft < MAINBUF_SIZE) {
+        refillMp3Input();
+    }
+
+    if (_mp3BytesLeft <= 4 && _mp3Eof) {
+        _mp3Finishing = true;
+        return finishMp3();
+    }
+    if (!hasMp3OutputSpace()) {
+        return Mp3ProcessResult::Playing;
+    }
+
+    for (uint8_t attempt = 0; attempt < 8 && _mp3BytesLeft > 4; ++attempt) {
+        if (s_stop_requested) {
+            stopMp3();
+            return Mp3ProcessResult::Stopped;
+        }
+
+        const int offset = MP3FindSyncWord(_mp3ReadPtr, _mp3BytesLeft);
+        if (offset < 0) {
+            _mp3BytesLeft = 0;
+            _mp3ReadPtr = s_mp3in;
+            break;
+        }
+
+        _mp3ReadPtr += offset;
+        _mp3BytesLeft -= offset;
+
+        const int decodeError =
+            MP3Decode(s_mp3dec, &_mp3ReadPtr, &_mp3BytesLeft, s_mp3out, 0);
+        if (decodeError == ERR_MP3_INDATA_UNDERFLOW ||
+            decodeError == ERR_MP3_MAINDATA_UNDERFLOW) {
+            break;
+        }
+        if (decodeError != ERR_MP3_NONE) {
+            if (_mp3BytesLeft > 0) {
+                ++_mp3ReadPtr;
+                --_mp3BytesLeft;
+            }
+            continue;
+        }
+
+        MP3FrameInfo frameInfo;
+        MP3GetLastFrameInfo(s_mp3dec, &frameInfo);
+        if (!_mp3Started) {
+            _mp3SampleRateEnum = mapSampleRate((uint32_t)frameInfo.samprate);
+            if (_mp3SampleRateEnum < 0) {
+                _err = "unsupported sample rate";
+                stopMp3();
+                return Mp3ProcessResult::Error;
+            }
+            _mp3SampleRate = (uint32_t)frameInfo.samprate;
+            _mp3Channels = frameInfo.nChans;
+            _mp3Started = true;
+        }
+
+        if (frameInfo.outputSamps > 0 &&
+            !pushBlockNonBlocking(s_mp3out, (size_t)frameInfo.outputSamps,
+                                   _mp3Channels == 2)) {
+            if (s_stop_requested) {
+                stopMp3();
+                return Mp3ProcessResult::Stopped;
+            }
+            _err = "I2S output buffer write failed";
+            stopMp3();
+            return Mp3ProcessResult::Error;
+        }
+
+        if (!_mp3OutputStarted &&
+            (s_ring_head - s_ring_tail) >= PREBUFFER_SLOTS) {
+            if (!startOutput(_mp3SampleRateEnum)) {
+                _err = "I2S output start failed";
+                stopMp3();
+                return Mp3ProcessResult::Error;
+            }
+            _mp3OutputStarted = true;
+        }
+        return Mp3ProcessResult::Playing;
+    }
+
+    if (_mp3Eof) {
+        _mp3Finishing = true;
+        return finishMp3();
+    }
+    return Mp3ProcessResult::Playing;
+}
+
+bool MAX98357::isMp3Playing(void) const
+{
+    return _mp3Active && !_mp3Paused;
+}
+
 bool MAX98357::playMp3(File &f)
 {
     f.seek(0);
@@ -671,6 +1109,10 @@ bool MAX98357::playMp3Stream(Client &s)
 
 bool MAX98357::playMp3Common(ReadFn rd, void *ctx)
 {
+    if (_mp3Active) {
+        _err = "non-blocking MP3 playback is active";
+        return false;
+    }
     if (!_inited) {
         _err = "begin() not called";
         return false;

@@ -35,6 +35,15 @@
 #include <Client.h>
 #include "AmebaFatFS.h"
 
+enum class Mp3ProcessResult : uint8_t {
+    Idle,
+    Playing,
+    Finished,
+    Stopped,
+    Paused,
+    Error
+};
+
 class MAX98357 {
 public:
     MAX98357();
@@ -72,8 +81,19 @@ public:
     bool playMp3Stream(Client &s);
     bool playMp3Stream(Stream &s);
 
+    // Cooperative, non-blocking MP3 playback from the SD card root.
+    // beginMp3() opens the file; processMp3() decodes a bounded amount of
+    // data and should be called repeatedly until it returns Finished, Stopped,
+    // or Error. Only one MP3 playback may be active at a time.
+    bool beginMp3(AmebaFatFS &fs, const char *filename);
+    Mp3ProcessResult processMp3(void);
+    void stopMp3(void);
+    bool pauseMp3(void);
+    bool resumeMp3(void);
+    bool isMp3Playing(void) const;
+
     // Ask the active playback call to stop as soon as possible. This only
-    // sets a flag; the task running playMp3()/playWav() performs the actual
+    // sets a flag; the task running playMp3()/playWav()/processMp3() performs the actual
     // I2S shutdown before returning. Do not call another play function until
     // the current one has returned.
     void requestStop(void);
@@ -98,11 +118,18 @@ private:
     bool startOutput(int srEnum);
     void stopOutput(uint32_t sampleRate);
     bool pushBlock(const int16_t *samples, size_t count, bool stereo);
+    bool pushBlockNonBlocking(const int16_t *samples, size_t count, bool stereo);
     bool flushSlot(void);
     void abortOutput(void);
     bool waitSlotFree(void);
     bool playWavCommon(ReadFn rd, void *ctx, bool canSeek, File *f);
     bool playMp3Common(ReadFn rd, void *ctx);
+    void closeMp3File(void);
+    void clearMp3State(void);
+    bool refillMp3Input(void);
+    bool hasMp3OutputSpace(void) const;
+    Mp3ProcessResult pauseMp3Step(void);
+    Mp3ProcessResult finishMp3(void);
     int mapSampleRate(uint32_t hz);
 
     uint16_t _vol_q8;        // volume in Q8 fixed point, 256 = 1.0
@@ -112,6 +139,26 @@ private:
     uint32_t _streamRate;    // sample rate set by beginPCM
     int _sdPin;              // GPIO driving SD_MODE, -1 = not used
     const char *_err;
+
+    File *_mp3File;
+    uint8_t *_mp3ReadPtr;
+    int _mp3BytesLeft;
+    bool _mp3Active;
+    bool _mp3Eof;
+    bool _mp3Started;
+    bool _mp3OutputStarted;
+    bool _mp3Paused;
+    bool _mp3PauseRequested;
+    bool _mp3PauseDrainStarted;
+    bool _mp3Finishing;
+    bool _mp3DrainStarted;
+    uint32_t _mp3SampleRate;
+    uint32_t _mp3DrainStartedMs;
+    uint32_t _mp3DrainDelayMs;
+    uint32_t _mp3PauseDrainStartedMs;
+    uint32_t _mp3PauseDrainDelayMs;
+    int _mp3SampleRateEnum;
+    int _mp3Channels;
 };
 
 #endif  // MAX98357_H
