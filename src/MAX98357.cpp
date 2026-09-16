@@ -24,7 +24,7 @@
 #include "mp3dec.h"      // Helix MP3 decoder, implemented in libhmp3.a
 
 #define I2S_DMA_PAGE_NUM  4
-#define I2S_DMA_PAGE_SIZE 2048  // bytes per page, multiple of 64, max 4095
+#define I2S_DMA_PAGE_SIZE 1024  // bytes per page, multiple of 64, max 4095
 
 // 32 KiB gives about 186 ms of headroom at 44.1 kHz stereo. This absorbs
 // normal WiFi scheduling gaps and occasional SD/FatFS read latency.
