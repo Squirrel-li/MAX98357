@@ -59,9 +59,12 @@ public:
     // Optional: wire the MAX98357 SD_MODE pin to a GPIO and register it
     // here. The amp is then held in hardware shutdown except while
     // audio is playing (eliminates idle heating on modules that fail to
-    // auto-shutdown on clock loss). Note: SD_MODE driven high by a
-    // 3.3V GPIO selects LEFT channel output.
-    void setShutdownPin(int pin);
+    // auto-shutdown on clock loss). The pin is only driven LOW to shut
+    // down and is released (high-Z) while playing, so the module's own
+    // SD_MODE resistor divider decides the channel (left/right/mix).
+    // pin2 is an optional second SD_MODE for a second amp module; both pins
+    // are shut down and released together.
+    void setShutdownPin(int pin, int pin2 = -1);
 
     // ---- WAV ----
     // Play a WAV file from the SD card root, blocking until finished.
@@ -137,7 +140,10 @@ private:
     bool _outputActive;
     uint16_t _streamChans;   // channels set by beginPCM
     uint32_t _streamRate;    // sample rate set by beginPCM
+    void sdAssertShutdown();
+    void sdRelease();
     int _sdPin;              // GPIO driving SD_MODE, -1 = not used
+    int _sdPin2;             // optional second amp's SD_MODE, -1 = not used
     const char *_err;
 
     File *_mp3File;
