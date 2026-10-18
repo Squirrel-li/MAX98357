@@ -169,7 +169,7 @@ static size_t readFromClient(void *ctx, uint8_t *buf, size_t len)
 
 MAX98357::MAX98357()
     : _vol_q8(256), _inited(false), _outputActive(false),
-      _streamChans(2), _streamRate(16000), _sdPin(-1), _sdPin2(-1), _err(""),
+      _streamChans(2), _streamRate(16000), _sdPin(-1), _err(""),
       _mp3File(NULL), _mp3ReadPtr(s_mp3in), _mp3BytesLeft(0),
       _mp3Active(false), _mp3Eof(false), _mp3Started(false),
       _mp3OutputStarted(false), _mp3Paused(false),
@@ -182,28 +182,22 @@ MAX98357::MAX98357()
 {
 }
 
-// SD_MODE is only ever driven LOW (shutdown). To run, the pin is released to
-// high-Z so the module's own pull-up/pull-down divider selects the channel.
+// SD_MODE LOW = shutdown, HIGH = run. Driven push-pull: with the module's
+// pull-up removed, a released pin would sit at 0 V (internal pull-down).
 void MAX98357::sdAssertShutdown()
 {
     pinMode(_sdPin, OUTPUT);
     digitalWrite(_sdPin, LOW);
-    if (_sdPin2 >= 0) {
-        pinMode(_sdPin2, OUTPUT);
-        digitalWrite(_sdPin2, LOW);
-    }
 }
 
-void MAX98357::sdRelease()
+void MAX98357::sdEnable()
 {
-    pinMode(_sdPin, INPUT);
-    if (_sdPin2 >= 0) pinMode(_sdPin2, INPUT);
+    digitalWrite(_sdPin, HIGH);
 }
 
-void MAX98357::setShutdownPin(int pin, int pin2)
+void MAX98357::setShutdownPin(int pin)
 {
     _sdPin = pin;
-    _sdPin2 = (pin >= 0) ? pin2 : -1;
     if (_sdPin >= 0) {
         sdAssertShutdown();  // hold the amp in shutdown until playback
     }
@@ -310,7 +304,7 @@ bool MAX98357::startOutput(int srEnum)
     i2s_enable(&s_i2s);
 
     if (_sdPin >= 0) {
-        sdRelease();
+        sdEnable();
         delay(2);  // SD_MODE turn-on time; clocks are already running
     }
     _outputActive = true;

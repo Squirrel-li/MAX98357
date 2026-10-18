@@ -107,7 +107,7 @@ amp.endPCM();
 | `bool begin()` | Initialize I2S0 (master/TX). Claims D11/D12/D22/D23/D24 |
 | `void end()` | Release the I2S peripheral and its pins |
 | `void setVolume(float vol)` | Software volume 0.0–1.0 (per-sample scaling), default 1.0 |
-| `void setShutdownPin(int pin, int pin2 = -1)` | Optional: GPIO wired to SD_MODE, driven LOW between playbacks for hardware shutdown (fixes idle heating on some modules) and released to high-Z while playing, so the module's own SD_MODE resistor divider selects the channel. `pin2` optionally controls a second amp module's SD_MODE together with the first |
+| `void setShutdownPin(int pin)` | Optional: GPIO wired to SD_MODE, driven LOW between playbacks for hardware shutdown (fixes idle heating on some modules) and HIGH while playing. One pin can enable a left/right pair: remove the modules' SD_MODE pull-ups, wire the left amp's SD_MODE directly and the right amp's through ~200 kΩ (3.3 V GPIO → ~1.1 V with the internal 100 kΩ pull-down) |
 | `bool playWav(AmebaFatFS &fs, const char *filename)` | Play a WAV from the SD card root (blocks until finished) |
 | `bool playWav(File &f)` | Play from an already-opened file |
 | `bool playWavStream(Stream &s)` | Play WAV from a forward-only stream (HTTP body, etc.) |

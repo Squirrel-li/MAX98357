@@ -107,7 +107,7 @@ amp.endPCM();
 | `bool begin()` | 初始化 I2S0(master/TX)。佔用 D11/D12/D22/D23/D24 |
 | `void end()` | 釋放 I2S 與腳位 |
 | `void setVolume(float vol)` | 軟體音量 0.0~1.0(逐 sample 縮放),預設 1.0 |
-| `void setShutdownPin(int pin, int pin2 = -1)` | 選用:指定接到 SD_MODE 的 GPIO,不播放時拉低硬體關斷(解決部分模組 idle 發熱問題),播放時釋放為高阻態,由模組自身的 SD_MODE 分壓電阻決定聲道。`pin2` 可選,用來同時控制第二片模組的 SD_MODE |
+| `void setShutdownPin(int pin)` | 選用:指定接到 SD_MODE 的 GPIO,不播放時拉低硬體關斷(解決部分模組 idle 發熱問題),播放時推 HIGH。一支腳可同時控制左右兩片:拆掉模組上的 SD_MODE 上拉,左聲道 SD_MODE 直接接 GPIO,右聲道串約 200 kΩ(3.3 V GPIO 與內部 100 kΩ 下拉分壓約 1.1 V) |
 | `bool playWav(AmebaFatFS &fs, const char *filename)` | 播放 SD 卡根目錄的 WAV(阻塞至播完) |
 | `bool playWav(File &f)` | 播放已開啟的檔案 |
 | `bool playWavStream(Stream &s)` | 從單向串流播放 WAV(HTTP body 等) |
